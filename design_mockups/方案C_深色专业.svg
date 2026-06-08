@@ -1,0 +1,26 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900">
+  <rect width="1440" height="900" fill="#111827"/>
+  <rect x="32" y="28" width="1376" height="844" rx="14" fill="#182132" stroke="#334155"/>
+  <text x="58" y="68" font-family="Microsoft YaHei, Arial" font-size="23" font-weight="700" fill="#f8fafc">发票汇编整理申报工具</text>
+  <text x="58" y="98" font-family="Microsoft YaHei" font-size="14" fill="#94a3b8">深色低干扰界面 · 适合长时间批量整理</text>
+  <rect x="58" y="132" width="112" height="38" rx="8" fill="#38bdf8"/><text x="86" y="157" font-family="Microsoft YaHei" font-size="15" fill="#082f49">添加 PDF</text>
+  <rect x="182" y="132" width="112" height="38" rx="8" fill="#243244" stroke="#3b82f6"/><text x="210" y="157" font-family="Microsoft YaHei" font-size="15" fill="#bfdbfe">添加图片</text>
+  <rect x="306" y="132" width="112" height="38" rx="8" fill="#1f2937" stroke="#475569"/><text x="334" y="157" font-family="Microsoft YaHei" font-size="15" fill="#e2e8f0">删除选中</text>
+  <rect x="430" y="132" width="112" height="38" rx="8" fill="#1f2937" stroke="#475569"/><text x="458" y="157" font-family="Microsoft YaHei" font-size="15" fill="#e2e8f0">修改选中</text>
+  <text x="574" y="156" font-family="Microsoft YaHei" font-size="15" fill="#cbd5e1">页眉共几张</text>
+  <rect x="664" y="132" width="96" height="38" rx="8" fill="#0f172a" stroke="#475569"/>
+  <rect x="1210" y="132" width="160" height="40" rx="9" fill="#22c55e"/><text x="1242" y="158" font-family="Microsoft YaHei" font-size="16" font-weight="700" fill="#052e16">生成汇编 PDF</text>
+  <rect x="58" y="208" width="810" height="596" rx="12" fill="#0f172a" stroke="#334155"/>
+  <text x="84" y="246" font-family="Microsoft YaHei" font-size="16" font-weight="700" fill="#f8fafc">页面列表</text>
+  <rect x="82" y="278" width="764" height="58" rx="9" fill="#1e3a5f" stroke="#38bdf8"/>
+  <text x="106" y="314" font-family="Microsoft YaHei" font-size="15" fill="#e0f2fe">差旅发票_001.pdf</text><text x="454" y="314" font-family="Microsoft YaHei" font-size="15" fill="#e0f2fe">580.00</text><text x="604" y="314" font-family="Microsoft YaHei" font-size="15" fill="#e0f2fe">2</text><text x="722" y="314" font-family="Microsoft YaHei" font-size="15" fill="#e0f2fe">1</text><text x="780" y="314" font-family="Microsoft YaHei" font-size="14" fill="#7dd3fc">完成</text>
+  <rect x="82" y="356" width="764" height="58" rx="9" fill="#111827" stroke="#334155"/>
+  <text x="106" y="392" font-family="Microsoft YaHei" font-size="15" fill="#cbd5e1">图片页（6张）：餐费.jpg 等</text><text x="454" y="392" font-family="Microsoft YaHei" font-size="15" fill="#cbd5e1">700.50</text><text x="604" y="392" font-family="Microsoft YaHei" font-size="15" fill="#cbd5e1">6</text><text x="722" y="392" font-family="Microsoft YaHei" font-size="15" fill="#cbd5e1">1</text>
+  <rect x="908" y="208" width="462" height="596" rx="12" fill="#0f172a" stroke="#334155"/>
+  <text x="936" y="246" font-family="Microsoft YaHei" font-size="16" font-weight="700" fill="#f8fafc">排版预览</text>
+  <rect x="948" y="306" width="336" height="238" fill="#f8fafc" stroke="#64748b"/>
+  <text x="984" y="336" font-family="Microsoft YaHei" font-size="12" fill="#111827">报销金额：700.50</text><text x="1088" y="336" font-family="Microsoft YaHei" font-size="12" fill="#111827">原始凭证张数：6</text><text x="1188" y="336" font-family="Microsoft YaHei" font-size="12" fill="#111827">第2页/共3张</text>
+  <line x1="978" y1="352" x2="1256" y2="352" stroke="#d1d5db"/>
+  <rect x="966" y="394" width="42" height="94" fill="#dbeafe" stroke="#60a5fa"/><rect x="1018" y="394" width="42" height="94" fill="#dcfce7" stroke="#4ade80"/><rect x="1070" y="394" width="42" height="94" fill="#fef3c7" stroke="#facc15"/><rect x="1122" y="394" width="42" height="94" fill="#fee2e2" stroke="#fb7185"/><rect x="1174" y="394" width="42" height="94" fill="#ede9fe" stroke="#a78bfa"/><rect x="1226" y="394" width="42" height="94" fill="#ccfbf1" stroke="#2dd4bf"/>
+  <text x="936" y="594" font-family="Microsoft YaHei" font-size="14" fill="#94a3b8">风格：稳重、对比强，适合暗色桌面环境。</text>
+</svg>

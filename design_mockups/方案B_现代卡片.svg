@@ -1,0 +1,36 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900">
+  <rect width="1440" height="900" fill="#eef2f5"/>
+  <rect x="0" y="0" width="1440" height="84" fill="#ffffff"/>
+  <text x="52" y="54" font-family="Microsoft YaHei, Arial" font-size="24" font-weight="700" fill="#172033">发票汇编</text>
+  <text x="166" y="54" font-family="Microsoft YaHei" font-size="14" fill="#697386">本地处理 · 横向 A4 · 实时预览</text>
+  <rect x="52" y="116" width="260" height="92" rx="10" fill="#ffffff" stroke="#d7dee8"/>
+  <text x="78" y="151" font-family="Microsoft YaHei" font-size="14" fill="#697386">合计报销金额</text><text x="78" y="185" font-family="Microsoft YaHei" font-size="28" font-weight="700" fill="#172033">1280.50</text>
+  <rect x="328" y="116" width="210" height="92" rx="10" fill="#ffffff" stroke="#d7dee8"/>
+  <text x="354" y="151" font-family="Microsoft YaHei" font-size="14" fill="#697386">原始凭证张数</text><text x="354" y="185" font-family="Microsoft YaHei" font-size="28" font-weight="700" fill="#172033">6</text>
+  <rect x="554" y="116" width="210" height="92" rx="10" fill="#ffffff" stroke="#d7dee8"/>
+  <text x="580" y="151" font-family="Microsoft YaHei" font-size="14" fill="#697386">汇编页数</text><text x="580" y="185" font-family="Microsoft YaHei" font-size="28" font-weight="700" fill="#172033">3</text>
+  <rect x="792" y="116" width="320" height="92" rx="10" fill="#ffffff" stroke="#d7dee8"/>
+  <text x="820" y="151" font-family="Microsoft YaHei" font-size="14" fill="#697386">页眉共几张</text><rect x="820" y="164" width="96" height="30" rx="6" fill="#f8fafc" stroke="#cbd5e1"/>
+  <rect x="1168" y="134" width="162" height="46" rx="9" fill="#0f766e"/><text x="1200" y="164" font-family="Microsoft YaHei" font-size="16" font-weight="700" fill="#fff">生成 PDF</text>
+  <rect x="52" y="236" width="244" height="590" rx="12" fill="#ffffff" stroke="#d7dee8"/>
+  <text x="80" y="274" font-family="Microsoft YaHei" font-size="16" font-weight="700" fill="#172033">操作</text>
+  <rect x="80" y="304" width="168" height="42" rx="8" fill="#0f766e"/><text x="122" y="331" font-family="Microsoft YaHei" font-size="15" fill="#fff">添加 PDF</text>
+  <rect x="80" y="360" width="168" height="42" rx="8" fill="#ecfdf5" stroke="#99f6e4"/><text x="122" y="387" font-family="Microsoft YaHei" font-size="15" fill="#0f766e">添加图片</text>
+  <rect x="80" y="416" width="168" height="42" rx="8" fill="#ffffff" stroke="#cbd5e1"/><text x="122" y="443" font-family="Microsoft YaHei" font-size="15" fill="#334155">修改选中</text>
+  <rect x="80" y="472" width="168" height="42" rx="8" fill="#ffffff" stroke="#cbd5e1"/><text x="122" y="499" font-family="Microsoft YaHei" font-size="15" fill="#334155">删除选中</text>
+  <rect x="324" y="236" width="562" height="590" rx="12" fill="#ffffff" stroke="#d7dee8"/>
+  <text x="352" y="274" font-family="Microsoft YaHei" font-size="16" font-weight="700" fill="#172033">发票页面</text>
+  <rect x="352" y="306" width="506" height="64" rx="10" fill="#f1f5f9"/>
+  <text x="378" y="343" font-family="Microsoft YaHei" font-size="15" fill="#172033">差旅发票_001.pdf</text><text x="710" y="343" font-family="Microsoft YaHei" font-size="15" fill="#172033">580.00</text><text x="802" y="343" font-family="Microsoft YaHei" font-size="15" fill="#0f766e">完成</text>
+  <rect x="352" y="388" width="506" height="64" rx="10" fill="#ffffff" stroke="#e2e8f0"/>
+  <text x="378" y="425" font-family="Microsoft YaHei" font-size="15" fill="#172033">图片页（4张）：餐费.jpg 等</text><text x="710" y="425" font-family="Microsoft YaHei" font-size="15" fill="#172033">700.50</text>
+  <rect x="916" y="236" width="414" height="590" rx="12" fill="#ffffff" stroke="#d7dee8"/>
+  <text x="944" y="274" font-family="Microsoft YaHei" font-size="16" font-weight="700" fill="#172033">实时预览</text>
+  <rect x="952" y="324" width="332" height="234" fill="#fff" stroke="#9ca3af"/>
+  <text x="984" y="355" font-family="Microsoft YaHei" font-size="12" fill="#111827">报销金额：700.50</text>
+  <text x="1090" y="355" font-family="Microsoft YaHei" font-size="12" fill="#111827">原始凭证张数：4</text>
+  <text x="1190" y="355" font-family="Microsoft YaHei" font-size="12" fill="#111827">第2页/共3张</text>
+  <line x1="982" y1="370" x2="1254" y2="370" stroke="#d1d5db"/>
+  <rect x="976" y="398" width="60" height="92" fill="#e0f2fe" stroke="#7dd3fc"/><rect x="1048" y="398" width="60" height="92" fill="#dcfce7" stroke="#86efac"/><rect x="1120" y="398" width="60" height="92" fill="#fef3c7" stroke="#fcd34d"/><rect x="1192" y="398" width="60" height="92" fill="#fee2e2" stroke="#fca5a5"/>
+  <text x="944" y="608" font-family="Microsoft YaHei" font-size="14" fill="#697386">风格：模块更清晰，适合经常处理多批次文件。</text>
+</svg>
