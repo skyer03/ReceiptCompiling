@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900">
+  <rect width="1440" height="900" fill="#f5f7fb"/>
+  <rect x="28" y="24" width="1384" height="852" rx="14" fill="#ffffff" stroke="#dbe3ef"/>
+  <rect x="28" y="24" width="1384" height="64" rx="14" fill="#ffffff"/>
+  <text x="56" y="64" font-family="Microsoft YaHei, Arial" font-size="22" font-weight="700" fill="#1f2937">发票汇编整理申报工具</text>
+  <rect x="56" y="116" width="118" height="38" rx="8" fill="#2563eb"/><text x="86" y="141" font-family="Microsoft YaHei" font-size="15" fill="#fff">添加 PDF</text>
+  <rect x="184" y="116" width="118" height="38" rx="8" fill="#eff6ff" stroke="#bfdbfe"/><text x="214" y="141" font-family="Microsoft YaHei" font-size="15" fill="#1d4ed8">添加图片</text>
+  <rect x="312" y="116" width="118" height="38" rx="8" fill="#fff" stroke="#d1d5db"/><text x="342" y="141" font-family="Microsoft YaHei" font-size="15" fill="#374151">删除选中</text>
+  <rect x="440" y="116" width="118" height="38" rx="8" fill="#fff" stroke="#d1d5db"/><text x="470" y="141" font-family="Microsoft YaHei" font-size="15" fill="#374151">修改选中</text>
+  <text x="590" y="140" font-family="Microsoft YaHei" font-size="15" fill="#4b5563">页眉共几张</text>
+  <rect x="680" y="116" width="96" height="38" rx="8" fill="#fff" stroke="#cbd5e1"/>
+  <rect x="1212" y="116" width="160" height="40" rx="9" fill="#16a34a"/><text x="1242" y="142" font-family="Microsoft YaHei" font-size="16" font-weight="700" fill="#fff">生成汇编 PDF</text>
+  <text x="56" y="194" font-family="Microsoft YaHei" font-size="15" fill="#475569">合计报销金额：1280.50    原始凭证张数：6    汇编页数：3</text>
+  <rect x="56" y="224" width="820" height="588" rx="10" fill="#fff" stroke="#dbe3ef"/>
+  <rect x="56" y="224" width="820" height="44" rx="10" fill="#f8fafc"/>
+  <text x="84" y="252" font-family="Microsoft YaHei" font-size="14" font-weight="700" fill="#334155">文件</text>
+  <text x="428" y="252" font-family="Microsoft YaHei" font-size="14" font-weight="700" fill="#334155">报销金额</text>
+  <text x="552" y="252" font-family="Microsoft YaHei" font-size="14" font-weight="700" fill="#334155">原始凭证张数</text>
+  <text x="688" y="252" font-family="Microsoft YaHei" font-size="14" font-weight="700" fill="#334155">汇编页数</text>
+  <text x="780" y="252" font-family="Microsoft YaHei" font-size="14" font-weight="700" fill="#334155">状态</text>
+  <rect x="70" y="284" width="792" height="54" rx="8" fill="#eff6ff" stroke="#bfdbfe"/>
+  <text x="84" y="318" font-family="Microsoft YaHei" font-size="15" fill="#1e293b">差旅发票_001.pdf</text><text x="452" y="318" font-family="Microsoft YaHei" font-size="15" fill="#1e293b">580.00</text><text x="604" y="318" font-family="Microsoft YaHei" font-size="15" fill="#1e293b">2</text><text x="722" y="318" font-family="Microsoft YaHei" font-size="15" fill="#1e293b">1</text><text x="780" y="318" font-family="Microsoft YaHei" font-size="14" fill="#2563eb">PDF 文字识别完成</text>
+  <text x="84" y="386" font-family="Microsoft YaHei" font-size="15" fill="#334155">图片页（4张）：餐费.jpg 等</text><text x="452" y="386" font-family="Microsoft YaHei" font-size="15" fill="#334155">700.50</text><text x="604" y="386" font-family="Microsoft YaHei" font-size="15" fill="#334155">4</text><text x="722" y="386" font-family="Microsoft YaHei" font-size="15" fill="#334155">1</text><text x="780" y="386" font-family="Microsoft YaHei" font-size="14" fill="#64748b">凭证张数已自动更新</text>
+  <rect x="916" y="224" width="456" height="588" rx="10" fill="#fff" stroke="#dbe3ef"/>
+  <text x="944" y="256" font-family="Microsoft YaHei" font-size="16" font-weight="700" fill="#1f2937">排版预览</text>
+  <rect x="950" y="302" width="338" height="238" fill="#fff" stroke="#aab2bf"/>
+  <text x="986" y="334" font-family="Microsoft YaHei" font-size="12" fill="#111827">报销金额：580.00</text>
+  <text x="1090" y="334" font-family="Microsoft YaHei" font-size="12" fill="#111827">原始凭证张数：2</text>
+  <text x="1190" y="334" font-family="Microsoft YaHei" font-size="12" fill="#111827">第1页/共3张</text>
+  <line x1="980" y1="350" x2="1258" y2="350" stroke="#d1d5db"/>
+  <rect x="1028" y="374" width="182" height="142" fill="#f8fafc" stroke="#94a3b8"/>
+  <text x="1080" y="448" font-family="Microsoft YaHei" font-size="14" fill="#64748b">PDF 缩放区域</text>
+  <text x="944" y="590" font-family="Microsoft YaHei" font-size="14" fill="#64748b">风格：清爽、熟悉、适合日常办公。</text>
+</svg>
