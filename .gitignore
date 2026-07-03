@@ -4,6 +4,7 @@ __pycache__/
 build/
 dist/
 *.rar
+*.zip
 
 *.log
 .DS_Store

@@ -1,12 +1,20 @@
 # -*- mode: python ; coding: utf-8 -*-
 
+from PyInstaller.utils.hooks import collect_submodules
+
+
+easyofd_hiddenimports = collect_submodules('easyofd', on_error='ignore')
+
 
 a = Analysis(
     ['invoice_compiler.py'],
-    pathex=[],
+    pathex=['tools/easyofd/easyofd-20260427'],
     binaries=[],
-    datas=[],
-    hiddenimports=[],
+    datas=[
+        ('tools/ofd2pdf', 'tools/ofd2pdf'),
+        ('tools/easyofd', 'tools/easyofd'),
+    ],
+    hiddenimports=easyofd_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

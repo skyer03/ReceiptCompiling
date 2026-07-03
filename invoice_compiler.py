@@ -1,13 +1,21 @@
 import os
+import contextlib
+import importlib.util
 import re
+import shutil
+import subprocess
 import sys
 import tempfile
 import tkinter as tk
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from html import unescape
+from io import BytesIO, StringIO
 from pathlib import Path
 from tkinter import filedialog, messagebox, ttk
+import xml.etree.ElementTree as ET
 
 from PIL import Image, ImageDraw, ImageFont, ImageTk
 from pypdf import PageObject, PdfReader, PdfWriter, Transformation
@@ -16,11 +24,15 @@ from reportlab.lib.pagesizes import A4, landscape
 from reportlab.pdfbase import pdfmetrics
 from reportlab.pdfbase.ttfonts import TTFont
 from reportlab.pdfgen import canvas
+from reportlab.lib.utils import ImageReader
 
 
-APP_TITLE = "发票汇编整理申报工具 -by tc"
+APP_VERSION = "2.0.0"
+APP_AUTHOR = "tc"
+APP_TITLE = f"发票汇编整理申报工具 v{APP_VERSION} -by {APP_AUTHOR}"
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".bmp", ".tif", ".tiff", ".webp"}
 PDF_EXTS = {".pdf"}
+OFD_EXTS = {".ofd"}
 PAGE_SIZE = landscape(A4)
 PAGE_WIDTH, PAGE_HEIGHT = PAGE_SIZE
 
@@ -30,14 +42,25 @@ HEADER_FONT_SIZE = 15  # 页眉字体大小；想更大就调高，比如 16。
 HEADER_Y = PAGE_HEIGHT - 48  # 页眉文字位置；数值越小越靠下，越大越靠上。
 HEADER_LINE_Y = PAGE_HEIGHT - 68  # 内容顶部参考位置；页眉下方不画线，但内容区域仍用它避开页眉。
 HEADER_SIDE_INSET = 90  # 页眉左右文字距离页面边缘的距离；越大越往中间收。
+PORTRAIT_SIDE_HEADER_X_OFFSET = 35  # 竖版 PDF 右侧页眉距离页面右边缘的距离；越大越往左。
+PORTRAIT_SIDE_HEADER_TOP = 150  # 竖版 PDF 右侧上方页眉距离页面顶端的距离；越大越靠下。
+PORTRAIT_SIDE_HEADER_BOTTOM = 150  # 竖版 PDF 右侧下方页眉距离页面底端的距离；越大越靠上。
+PORTRAIT_SIDE_HEADER_MARGIN = 48  # 竖版 PDF 内容区右侧预留给页眉的宽度；越大右侧留白越多。
+PORTRAIT_CONTENT_LEFT = 24  # 竖版 PDF 内容区左边距；越小原 PDF 越大。
+PORTRAIT_CONTENT_VERTICAL_MARGIN = 24  # 竖版 PDF 上下边距；越小原 PDF 越大。
 CONTENT_LEFT = 52  # 内容区域左边距；图片和 PDF 都会参考这个区域。
-CONTENT_RIGHT = PAGE_WIDTH - 52  # 内容区域右边距。
+CONTENT_RIGHT_MARGIN = 52  # 内容区域右边距；越大右侧留白越多。
+CONTENT_RIGHT = PAGE_WIDTH - CONTENT_RIGHT_MARGIN  # 横向 A4 默认内容右边界。
 CONTENT_BOTTOM = 38  # 内容区域下边距。
-CONTENT_TOP = HEADER_LINE_Y - 20  # 内容区域顶部；用于避免内容压到页眉。
+CONTENT_TOP_OFFSET = PAGE_HEIGHT - (HEADER_LINE_Y - 20)  # 内容顶部距离页面顶端的距离；越大内容越靠下。
+CONTENT_TOP = PAGE_HEIGHT - CONTENT_TOP_OFFSET  # 横向 A4 默认内容顶部。
 PDF_SCALE_FACTOR = 0.90  # PDF 原页缩放比例；越小 PDF 越小，留白越多。
 PDF_X_OFFSET = 34  # PDF 缩小后向右偏移量；越大越靠右，左侧留白越多。
 IMAGE_GAP = 14  # 多张图片之间的间距；越大图片之间空隙越宽。
 PREVIEW_PANEL_WIDTH = 440  # 右侧预览栏宽度；想让预览更大就调高。
+
+# 页眉纵向位置用横版 A4 做基准；竖版页面会自动保持同样的顶部距离。
+HEADER_TOP_OFFSET = PAGE_HEIGHT - HEADER_Y
 
 
 def bundled_python() -> str:
@@ -70,10 +93,19 @@ class InvoiceItem:
     status: str
     extracted_text: str = ""
     image_paths: list[Path] | None = None
+    render_path: Path | None = None
 
     @property
     def is_pdf(self) -> bool:
         return self.path.suffix.lower() in PDF_EXTS
+
+    @property
+    def is_ofd(self) -> bool:
+        return self.path.suffix.lower() in OFD_EXTS
+
+    @property
+    def is_document(self) -> bool:
+        return self.is_pdf or self.is_ofd
 
     @property
     def is_image_page(self) -> bool:
@@ -86,6 +118,130 @@ class InvoiceItem:
                 return self.image_paths[0].name
             return f"图片页（{len(self.image_paths)}张）：{self.image_paths[0].name} 等"
         return self.path.name
+
+
+def page_size_for_aspect(width: float, height: float) -> tuple[float, float]:
+    return A4 if height >= width else PAGE_SIZE
+
+
+def pdf_visible_box(page: PageObject) -> tuple[float, float, float, float]:
+    # 一些发票的 MediaBox 是竖版 A4，但真正可见的 CropBox 是横版。
+    # 页面方向和缩放必须优先按照 CropBox 判断。
+    box = page.cropbox
+    width = float(box.width)
+    height = float(box.height)
+    if width <= 0 or height <= 0:
+        box = page.mediabox
+        width = float(box.width)
+        height = float(box.height)
+    return float(box.left), float(box.bottom), width, height
+
+
+def pdf_display_size(page: PageObject) -> tuple[float, float]:
+    _left, _bottom, width, height = pdf_visible_box(page)
+    if int(page.rotation or 0) % 180:
+        return height, width
+    return width, height
+
+
+def total_voucher_count(items: list[InvoiceItem]) -> int:
+    # “共几张”的自动值是所有列表项当前凭证张数之和，包含用户手动修改后的数值。
+    return sum(max(0, item.voucher_count) for item in items)
+
+
+def content_bounds(page_width: float, page_height: float) -> tuple[float, float, float, float]:
+    left = CONTENT_LEFT
+    right = page_width - CONTENT_RIGHT_MARGIN
+    bottom = CONTENT_BOTTOM
+    top = page_height - CONTENT_TOP_OFFSET
+    return left, right, bottom, top
+
+
+def document_content_bounds(page_width: float, page_height: float) -> tuple[float, float, float, float]:
+    if page_height > page_width:
+        return (
+            PORTRAIT_CONTENT_LEFT,
+            page_width - PORTRAIT_SIDE_HEADER_MARGIN,
+            PORTRAIT_CONTENT_VERTICAL_MARGIN,
+            page_height - PORTRAIT_CONTENT_VERTICAL_MARGIN,
+        )
+    return content_bounds(page_width, page_height)
+
+
+def header_y_for_page(page_height: float) -> float:
+    return page_height - HEADER_TOP_OFFSET
+
+
+def portrait_side_header_items(
+    height: float, amount: Decimal | None, vouchers: int, page_no: int, total_pages_text: str
+) -> list[tuple[str, float]]:
+    return [
+        (f"报销金额：{format_money(amount)}", height - PORTRAIT_SIDE_HEADER_TOP),
+        (f"原始凭证张数：{vouchers}", height / 2),
+        (f"第{page_no}页/共{total_pages_text or '  '}张", PORTRAIT_SIDE_HEADER_BOTTOM),
+    ]
+
+
+def is_single_portrait_image_page(item: InvoiceItem) -> bool:
+    paths = item.image_paths or [item.path]
+    if len(paths) != 1:
+        return False
+    try:
+        with Image.open(paths[0]) as img:
+            return img.height >= img.width
+    except Exception:
+        return False
+
+
+def uses_portrait_side_header(item: InvoiceItem, page_width: float, page_height: float) -> bool:
+    return page_height > page_width and (item.is_document or is_single_portrait_image_page(item))
+
+
+def draw_portrait_side_header(
+    c: canvas.Canvas, width: float, height: float, amount: Decimal | None, vouchers: int, page_no: int, total_pages_text: str
+) -> None:
+    x = width - PORTRAIT_SIDE_HEADER_X_OFFSET
+    for text, center_y in portrait_side_header_items(height, amount, vouchers, page_no, total_pages_text):
+        text_width = pdfmetrics.stringWidth(text, FONT_NAME, HEADER_FONT_SIZE)
+        c.saveState()
+        c.translate(x, center_y + text_width / 2)
+        c.rotate(-90)
+        c.drawString(0, 0, text)
+        c.restoreState()
+
+
+def preview_page_size_for_item(item: InvoiceItem) -> tuple[float, float]:
+    if item.is_image_page or item.path.suffix.lower() in IMAGE_EXTS:
+        return A4 if is_single_portrait_image_page(item) else PAGE_SIZE
+    if item.is_document:
+        source_path = item.render_path or item.path
+        if source_path.suffix.lower() in PDF_EXTS and source_path.exists():
+            try:
+                first_page = PdfReader(str(source_path)).pages[0]
+                source_w, source_h = pdf_display_size(first_page)
+                return page_size_for_aspect(source_w, source_h)
+            except Exception:
+                pass
+        return A4
+    return PAGE_SIZE
+
+
+def app_resource_dir() -> Path:
+    # PyInstaller 打包后，内嵌资源会被释放到 sys._MEIPASS；源码运行时则使用当前脚本目录。
+    if getattr(sys, "frozen", False) and hasattr(sys, "_MEIPASS"):
+        return Path(sys._MEIPASS)  # type: ignore[attr-defined]
+    return Path(__file__).resolve().parent
+
+
+def bundled_ofd_converter_exe() -> Path | None:
+    # OFD 转 PDF 工具放在 tools/ofd2pdf；打包时也会按这个目录结构内嵌。
+    candidate = app_resource_dir() / "tools" / "ofd2pdf" / "Ofd2Pdf.exe"
+    return candidate if candidate.exists() else None
+
+
+def bundled_easyofd_dir() -> Path | None:
+    candidate = app_resource_dir() / "tools" / "easyofd" / "easyofd-20260427"
+    return candidate if candidate.exists() else None
 
 
 def normalize_amount(value: str | Decimal | int | float | None) -> Decimal | None:
@@ -113,15 +269,16 @@ def default_output_filename() -> str:
 def extract_amount(text: str) -> Decimal | None:
     compact = re.sub(r"\s+", "", text)
     patterns = [
+        r"(?:CNY|RMB|人民币|¥|￥)\s*([0-9]{1,7}(?:,[0-9]{3})*\.[0-9]{2})",
         r"(?:价税合计|小写|合计金额|报销金额|金额合计|总金额|合计)[：:（(]?(?:人民币)?[¥￥]?([0-9][0-9,]*\.?[0-9]{0,2})",
         r"[¥￥]\s*([0-9][0-9,]*\.?[0-9]{0,2})",
-        r"([0-9][0-9,]*\.[0-9]{2})",
+        r"\b([0-9]{1,7}(?:,[0-9]{3})*\.[0-9]{2})\b",
     ]
     amounts: list[Decimal] = []
     for pattern in patterns:
         for match in re.findall(pattern, compact):
             amount = normalize_amount(match)
-            if amount is not None and amount > 0:
+            if amount is not None and Decimal("0") < amount < Decimal("10000000"):
                 amounts.append(amount)
         if amounts:
             break
@@ -157,12 +314,426 @@ def read_pdf_text_and_pages(path: Path) -> tuple[str, int, str]:
         return "", 0, f"PDF 读取失败：{exc}"
 
 
+def read_ofd_text(path: Path) -> tuple[str, str]:
+    try:
+        texts: list[str] = []
+        with zipfile.ZipFile(path) as zf:
+            for name in zf.namelist():
+                if not name.lower().endswith((".xml", ".txt")):
+                    continue
+                raw = zf.read(name).decode("utf-8", errors="ignore")
+                plain = re.sub(r"<[^>]+>", " ", raw)
+                texts.append(unescape(plain))
+        text = re.sub(r"\s+", " ", "\n".join(texts)).strip()
+        if text:
+            return text, "OFD 文字识别完成"
+        return "", "OFD 已添加，未提取到文字，需手动核对金额"
+    except zipfile.BadZipFile:
+        return "", "OFD 读取失败：文件不是可解析的 OFD 包"
+    except Exception as exc:
+        return "", f"OFD 读取失败：{exc}"
+
+
+def xml_local_name(tag: str) -> str:
+    return tag.rsplit("}", 1)[-1]
+
+
+def parse_ofd_box(value: str | None) -> tuple[float, float, float, float] | None:
+    if not value:
+        return None
+    parts = value.replace(",", " ").split()
+    if len(parts) < 4:
+        return None
+    try:
+        return tuple(float(part) for part in parts[:4])  # type: ignore[return-value]
+    except ValueError:
+        return None
+
+
+def ofd_media_map(zf: zipfile.ZipFile, doc_dir: str) -> dict[str, str]:
+    mapping: dict[str, str] = {}
+    res_path = f"{doc_dir}/DocumentRes.xml"
+    if res_path not in zf.namelist():
+        return mapping
+    try:
+        root = ET.fromstring(zf.read(res_path))
+    except Exception:
+        return mapping
+    base_loc = root.attrib.get("BaseLoc", "Res")
+    for node in root.iter():
+        if xml_local_name(node.tag) != "MultiMedia":
+            continue
+        media_id = node.attrib.get("ID")
+        media_file = None
+        for child in node:
+            if xml_local_name(child.tag) == "MediaFile" and child.text:
+                media_file = child.text.strip()
+                break
+        if media_id and media_file:
+            mapping[media_id] = f"{doc_dir}/{base_loc}/{media_file}".replace("\\", "/")
+    return mapping
+
+
+def draw_simple_ofd_content(c: canvas.Canvas, zf: zipfile.ZipFile, xml_path: str, page_height: float, unit: float, media: dict[str, str]) -> None:
+    try:
+        root = ET.fromstring(zf.read(xml_path))
+    except Exception:
+        return
+
+    for node in root.iter():
+        name = xml_local_name(node.tag)
+        box = parse_ofd_box(node.attrib.get("Boundary"))
+        if name == "PathObject" and box:
+            x, y, _w, _h = box
+            data = ""
+            for child in node:
+                if xml_local_name(child.tag) == "AbbreviatedData" and child.text:
+                    data = child.text
+                    break
+            numbers = [float(part) for part in re.findall(r"-?\d+(?:\.\d+)?", data)]
+            if len(numbers) >= 4:
+                x1, y1, x2, y2 = numbers[:4]
+                c.setStrokeColor(colors.black)
+                c.setLineWidth(0.35)
+                c.line((x + x1) * unit, page_height - (y + y1) * unit, (x + x2) * unit, page_height - (y + y2) * unit)
+
+        elif name == "TextObject" and box:
+            x, y, _w, _h = box
+            size = float(node.attrib.get("Size", "3") or 3) * unit
+            c.setFont(FONT_NAME, max(4, size))
+            fill_color = colors.black
+            for child in node:
+                if xml_local_name(child.tag) == "FillColor":
+                    parts = child.attrib.get("Value", "").split()
+                    if len(parts) >= 3:
+                        try:
+                            fill_color = colors.Color(int(parts[0]) / 255, int(parts[1]) / 255, int(parts[2]) / 255)
+                        except Exception:
+                            fill_color = colors.black
+            c.setFillColor(fill_color)
+            for child in node:
+                if xml_local_name(child.tag) != "TextCode":
+                    continue
+                text = "".join(child.itertext()).strip()
+                if not text:
+                    continue
+                tx = float(child.attrib.get("X", "0") or 0)
+                ty = float(child.attrib.get("Y", "0") or 0)
+                c.drawString((x + tx) * unit, page_height - (y + ty) * unit, text)
+
+        elif name == "ImageObject" and box:
+            resource_id = node.attrib.get("ResourceID")
+            image_path = media.get(resource_id or "")
+            if not image_path or image_path not in zf.namelist():
+                continue
+            x, y, w, h = box
+            try:
+                image = ImageReader(BytesIO(zf.read(image_path)))
+                c.drawImage(image, x * unit, page_height - (y + h) * unit, width=w * unit, height=h * unit, mask="auto")
+            except Exception:
+                continue
+
+
+def render_simple_ofd_to_pdf(path: Path) -> tuple[Path | None, str]:
+    try:
+        with zipfile.ZipFile(path) as zf:
+            doc_xml_path = next((name for name in zf.namelist() if name.endswith("Document.xml")), "")
+            if not doc_xml_path:
+                return None, "OFD 简易渲染失败：未找到 Document.xml"
+            doc_dir = str(Path(doc_xml_path).parent).replace("\\", "/")
+            doc_root = ET.fromstring(zf.read(doc_xml_path))
+            physical_box = None
+            page_paths: list[str] = []
+            template_paths: list[str] = []
+            for node in doc_root.iter():
+                local = xml_local_name(node.tag)
+                if local == "PhysicalBox" and node.text and physical_box is None:
+                    physical_box = parse_ofd_box(node.text)
+                elif local == "TemplatePage":
+                    base_loc = node.attrib.get("BaseLoc")
+                    if base_loc:
+                        template_paths.append(f"{doc_dir}/{base_loc}".replace("\\", "/"))
+                elif local == "Page":
+                    base_loc = node.attrib.get("BaseLoc")
+                    if base_loc:
+                        page_paths.append(f"{doc_dir}/{base_loc}".replace("\\", "/"))
+            if not physical_box or not page_paths:
+                return None, "OFD 简易渲染失败：页面结构不完整"
+
+            _x, _y, page_w_mm, page_h_mm = physical_box
+            unit = 72 / 25.4
+            page_w = page_w_mm * unit
+            page_h = page_h_mm * unit
+            output = Path(tempfile.NamedTemporaryFile(delete=False, suffix=".pdf").name)
+            c = canvas.Canvas(str(output), pagesize=(page_w, page_h))
+            media = ofd_media_map(zf, doc_dir)
+            for page_index, page_path in enumerate(page_paths):
+                if page_index:
+                    c.showPage()
+                for template_path in template_paths:
+                    if template_path in zf.namelist():
+                        draw_simple_ofd_content(c, zf, template_path, page_h, unit, media)
+                draw_simple_ofd_content(c, zf, page_path, page_h, unit, media)
+            c.save()
+            if output.exists() and output.stat().st_size > 0:
+                return output, "OFD 内嵌工具不支持，已使用简易渲染生成 PDF"
+            return None, "OFD 简易渲染失败：未生成 PDF"
+    except Exception as exc:
+        return None, f"OFD 简易渲染失败：{exc}"
+
+
+class _QuietLogger:
+    def __getattr__(self, _name: str):
+        return lambda *args, **kwargs: None
+
+
+def _easyofd_xml_key(tag: str) -> str:
+    if tag.startswith("{http://www.ofdspec.org/2016}"):
+        return "ofd:" + tag.rsplit("}", 1)[-1]
+    return tag.rsplit("}", 1)[-1]
+
+
+def _easyofd_xml_convert(node: ET.Element):
+    data: dict[str, object] = {f"@{key}": value for key, value in node.attrib.items()}
+    children: dict[str, list[object]] = {}
+    for child in list(node):
+        children.setdefault(_easyofd_xml_key(child.tag), []).append(_easyofd_xml_convert(child))
+    for key, values in children.items():
+        data[key] = values[0] if len(values) == 1 else values
+    text = (node.text or "").strip()
+    if text:
+        if data:
+            data["#text"] = text
+        else:
+            return text
+    return data
+
+
+def _install_easyofd_compat_modules() -> None:
+    if importlib.util.find_spec("loguru") is None:
+        sys.modules["loguru"] = type(sys)("loguru")
+        sys.modules["loguru"].logger = _QuietLogger()  # type: ignore[attr-defined]
+
+    if importlib.util.find_spec("fitz") is None:
+        sys.modules["fitz"] = type(sys)("fitz")
+
+    if importlib.util.find_spec("xmltodict") is None:
+        xmltodict_module = type(sys)("xmltodict")
+
+        def parse(xml_text: str):
+            root = ET.fromstring(xml_text)
+            return {_easyofd_xml_key(root.tag): _easyofd_xml_convert(root)}
+
+        xmltodict_module.parse = parse  # type: ignore[attr-defined]
+        xmltodict_module.unparse = lambda *args, **kwargs: ""  # type: ignore[attr-defined]
+        sys.modules["xmltodict"] = xmltodict_module
+
+    if importlib.util.find_spec("fontTools") is None:
+        font_tools = type(sys)("fontTools")
+        tt_lib = type(sys)("fontTools.ttLib")
+        pens = type(sys)("fontTools.pens")
+        base_pen = type(sys)("fontTools.pens.basePen")
+
+        class DummyTTFont:
+            def __init__(self, *args, **kwargs):
+                pass
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *args):
+                return None
+
+            def getGlyphSet(self):
+                return {}
+
+        class DummyBasePen:
+            pass
+
+        tt_lib.TTFont = DummyTTFont  # type: ignore[attr-defined]
+        base_pen.BasePen = DummyBasePen  # type: ignore[attr-defined]
+        sys.modules["fontTools"] = font_tools
+        sys.modules["fontTools.ttLib"] = tt_lib
+        sys.modules["fontTools.pens"] = pens
+        sys.modules["fontTools.pens.basePen"] = base_pen
+
+    if importlib.util.find_spec("pyasn1") is None:
+        for name in [
+            "pyasn1",
+            "pyasn1.codec",
+            "pyasn1.codec.der",
+            "pyasn1.codec.der.decoder",
+            "pyasn1.type",
+            "pyasn1.type.univ",
+            "pyasn1.error",
+        ]:
+            sys.modules[name] = type(sys)(name)
+
+        def decode(*args, **kwargs):
+            raise Exception("pyasn1 unavailable")
+
+        class PyAsn1Error(Exception):
+            pass
+
+        sys.modules["pyasn1.codec.der.decoder"].decode = decode  # type: ignore[attr-defined]
+        sys.modules["pyasn1.error"].PyAsn1Error = PyAsn1Error  # type: ignore[attr-defined]
+
+
+def convert_ofd_with_easyofd(path: Path) -> tuple[Path | None, str]:
+    easyofd_dir = bundled_easyofd_dir()
+    try:
+        _install_easyofd_compat_modules()
+        if easyofd_dir:
+            easyofd_path = str(easyofd_dir)
+        else:
+            easyofd_path = ""
+        if easyofd_path and easyofd_path not in sys.path:
+            sys.path.insert(0, easyofd_path)
+        from easyofd.ofd import OFD  # type: ignore
+
+        ofd = OFD()
+        with contextlib.redirect_stdout(StringIO()), contextlib.redirect_stderr(StringIO()):
+            ofd.read(str(path), fmt="path")
+            pdf_bytes = ofd.to_pdf()
+        try:
+            ofd.del_data()
+        except Exception:
+            pass
+        output = Path(tempfile.NamedTemporaryFile(delete=False, suffix=".pdf").name)
+        output.write_bytes(pdf_bytes)
+        if output.exists() and output.stat().st_size > 0:
+            return output, "OFD 已通过 easyofd 转换为 PDF"
+        return None, "easyofd 未生成 PDF"
+    except Exception as exc:
+        return None, f"easyofd 转换失败：{exc}"
+
+
+def convert_ofd_to_pdf(path: Path) -> tuple[Path | None, str]:
+    output = Path(tempfile.NamedTemporaryFile(delete=False, suffix=".pdf").name)
+
+    bundled_converter = bundled_ofd_converter_exe()
+    if bundled_converter:
+        powershell = shutil.which("powershell") or shutil.which("powershell.exe")
+        if not powershell:
+            easyofd_path, easyofd_status = convert_ofd_with_easyofd(path)
+            if easyofd_path:
+                return easyofd_path, easyofd_status
+            return render_simple_ofd_to_pdf(path)
+        script = r"""param(
+    [string]$tool,
+    [string]$inputPath,
+    [string]$outputPath
+)
+$ErrorActionPreference = 'Stop'
+$toolDir = Split-Path -Parent $tool
+[System.IO.Directory]::SetCurrentDirectory($toolDir)
+Get-ChildItem -LiteralPath $toolDir -Filter '*.dll' | ForEach-Object {
+    [System.Reflection.Assembly]::LoadFile($_.FullName) | Out-Null
+}
+$assembly = [System.Reflection.Assembly]::LoadFile($tool)
+$converterType = $assembly.GetType('Ofd2Pdf.Converter')
+$converter = [System.Activator]::CreateInstance($converterType)
+$result = $converter.ConvertToPdf($inputPath, $outputPath)
+if ($result.ToString() -eq 'Successful' -and (Test-Path $outputPath)) { exit 0 }
+Write-Error ("OFD convert failed: " + $result.ToString())
+exit 2
+"""
+        script_path = Path(tempfile.NamedTemporaryFile(delete=False, suffix=".ps1").name)
+        script_path.write_text(script, encoding="utf-8")
+        try:
+            subprocess.run(
+                [
+                    powershell,
+                    "-NoProfile",
+                    "-ExecutionPolicy",
+                    "Bypass",
+                    "-STA",
+                    "-File",
+                    str(script_path),
+                    "-tool",
+                    str(bundled_converter),
+                    "-inputPath",
+                    str(path),
+                    "-outputPath",
+                    str(output),
+                ],
+                check=True,
+                capture_output=True,
+                timeout=90,
+                cwd=str(bundled_converter.parent),
+            )
+            if output.exists() and output.stat().st_size > 0:
+                return output, "OFD 已通过内嵌工具转换为 PDF"
+        except subprocess.CalledProcessError:
+            try:
+                output.unlink(missing_ok=True)
+            except Exception:
+                pass
+            easyofd_path, easyofd_status = convert_ofd_with_easyofd(path)
+            if easyofd_path:
+                return easyofd_path, easyofd_status
+            return render_simple_ofd_to_pdf(path)
+        except Exception as exc:
+            try:
+                output.unlink(missing_ok=True)
+            except Exception:
+                pass
+            easyofd_path, easyofd_status = convert_ofd_with_easyofd(path)
+            if easyofd_path:
+                return easyofd_path, easyofd_status
+            simple_path, simple_status = render_simple_ofd_to_pdf(path)
+            if simple_path:
+                return simple_path, simple_status
+            return None, f"OFD 内嵌转换失败，生成时会放入提示页：{exc}"
+        finally:
+            try:
+                script_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    converter = shutil.which("ofd2pdf")
+    if not converter:
+        return None, "未检测到 OFD 转 PDF 工具，生成时会放入提示页"
+
+    commands = [
+        [converter, str(path), str(output)],
+        [converter, "-i", str(path), "-o", str(output)],
+    ]
+    last_error = ""
+    for command in commands:
+        try:
+            subprocess.run(command, check=True, capture_output=True, timeout=60)
+            if output.exists() and output.stat().st_size > 0:
+                return output, "OFD 已转换为 PDF，可按 PDF 方式汇编"
+        except Exception as exc:
+            last_error = str(exc)
+    try:
+        output.unlink(missing_ok=True)
+    except Exception:
+        pass
+    easyofd_path, easyofd_status = convert_ofd_with_easyofd(path)
+    if easyofd_path:
+        return easyofd_path, easyofd_status
+    simple_path, simple_status = render_simple_ofd_to_pdf(path)
+    if simple_path:
+        return simple_path, simple_status
+    return None, f"OFD 转 PDF 失败，生成时会放入提示页：{last_error}"
+
+
 def inspect_file(path: Path) -> InvoiceItem:
     suffix = path.suffix.lower()
     if suffix in PDF_EXTS:
         text, pages, status = read_pdf_text_and_pages(path)
         amount = extract_amount(text)
         return InvoiceItem(path, amount, max(pages, 1), max(pages, 1), status, text)
+    if suffix in OFD_EXTS:
+        text, status = read_ofd_text(path)
+        render_path, convert_status = convert_ofd_to_pdf(path)
+        pages = 1
+        if render_path:
+            _pdf_text, pages, _pdf_status = read_pdf_text_and_pages(render_path)
+        amount = extract_amount(text)
+        return InvoiceItem(path, amount, max(pages, 1), max(pages, 1), f"{status}；{convert_status}", text, render_path=render_path)
     if suffix in IMAGE_EXTS:
         text, status = try_image_ocr(path)
         amount = extract_amount(text)
@@ -173,43 +744,77 @@ def inspect_file(path: Path) -> InvoiceItem:
 def make_header_overlay(width: float, height: float, amount: Decimal | None, vouchers: int, page_no: int, total_pages_text: str) -> str:
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     tmp.close()
+    header_y = header_y_for_page(height)
     c = canvas.Canvas(tmp.name, pagesize=(width, height))
     c.setFont(FONT_NAME, HEADER_FONT_SIZE)
     c.setFillColor(colors.black)
-    c.drawString(HEADER_SIDE_INSET, HEADER_Y, f"报销金额：{format_money(amount)}")
-    c.drawCentredString(width / 2, HEADER_Y, f"原始凭证张数：{vouchers}")
-    c.drawRightString(width - HEADER_SIDE_INSET, HEADER_Y, f"第{page_no}页/共{total_pages_text or '  '}张")
+    if height > width:
+        draw_portrait_side_header(c, width, height, amount, vouchers, page_no, total_pages_text)
+    else:
+        c.drawString(HEADER_SIDE_INSET, header_y, f"报销金额：{format_money(amount)}")
+        c.drawCentredString(width / 2, header_y, f"原始凭证张数：{vouchers}")
+        c.drawRightString(width - HEADER_SIDE_INSET, header_y, f"第{page_no}页/共{total_pages_text or '  '}张")
     c.save()
     return tmp.name
 
 
 def add_header_to_page(page: PageObject, amount: Decimal | None, vouchers: int, page_no: int, total_pages_text: str) -> None:
-    overlay_path = make_header_overlay(PAGE_WIDTH, PAGE_HEIGHT, amount, vouchers, page_no, total_pages_text)
+    page_width = float(page.mediabox.width)
+    page_height = float(page.mediabox.height)
+    overlay_path = make_header_overlay(page_width, page_height, amount, vouchers, page_no, total_pages_text)
     overlay = PdfReader(overlay_path).pages[0]
     page.merge_page(overlay)
     os.unlink(overlay_path)
 
 
 def add_pdf_pages(writer: PdfWriter, item: InvoiceItem, amount: Decimal | None, vouchers: int, start_page: int, total_pages_text: str) -> int:
-    reader = PdfReader(str(item.path))
+    source_path = item.render_path or item.path
+    reader = PdfReader(str(source_path))
     page_no = start_page
-    content_w = CONTENT_RIGHT - CONTENT_LEFT
-    content_h = CONTENT_TOP - CONTENT_BOTTOM
     for source_page in reader.pages:
-        source_w = float(source_page.mediabox.width)
-        source_h = float(source_page.mediabox.height)
-        scale = min(content_w / source_w, content_h / source_h) * PDF_SCALE_FACTOR
+        # 规范化 PDF 自带的 /Rotate 标记，只保留文件原本的视觉方向，不额外旋转页面。
+        if source_page.rotation:
+            source_page.transfer_rotation_to_content()
+        source_left, source_bottom, source_w, source_h = pdf_visible_box(source_page)
+        target_w, target_h = page_size_for_aspect(source_w, source_h)
+        content_left, content_right, content_bottom, content_top = document_content_bounds(target_w, target_h)
+        content_w = content_right - content_left
+        content_h = content_top - content_bottom
+        scale_factor = 0.98 if target_h > target_w else PDF_SCALE_FACTOR
+        scale = min(content_w / source_w, content_h / source_h) * scale_factor
         draw_w = source_w * scale
         draw_h = source_h * scale
-        centered_x = CONTENT_LEFT + (content_w - draw_w) / 2
-        x = min(centered_x + PDF_X_OFFSET, CONTENT_RIGHT - draw_w)
-        y = CONTENT_BOTTOM + (content_h - draw_h) / 2
-        page = PageObject.create_blank_page(width=PAGE_WIDTH, height=PAGE_HEIGHT)
-        page.merge_transformed_page(source_page, Transformation().scale(scale).translate(x, y))
+        centered_x = content_left + (content_w - draw_w) / 2
+        x = min(centered_x + PDF_X_OFFSET, content_right - draw_w)
+        y = content_bottom + (content_h - draw_h) / 2
+        page = PageObject.create_blank_page(width=target_w, height=target_h)
+        transform = Transformation().translate(-source_left, -source_bottom).scale(scale).translate(x, y)
+        page.merge_transformed_page(source_page, transform)
         add_header_to_page(page, amount, vouchers, page_no, total_pages_text)
         writer.add_page(page)
         page_no += 1
     return page_no
+
+
+def add_ofd_notice_page(writer: PdfWriter, item: InvoiceItem, page_no: int, total_pages_text: str) -> int:
+    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
+    tmp.close()
+    width, height = A4
+    c = canvas.Canvas(tmp.name, pagesize=A4)
+    c.setFont(FONT_NAME, HEADER_FONT_SIZE)
+    header_y = header_y_for_page(height)
+    c.drawString(HEADER_SIDE_INSET, header_y, f"报销金额：{format_money(item.amount)}")
+    c.drawCentredString(width / 2, header_y, f"原始凭证张数：{item.voucher_count}")
+    c.drawRightString(width - HEADER_SIDE_INSET, header_y, f"第{page_no}页/共{total_pages_text or '   '}张")
+    c.setFont(FONT_NAME, 13)
+    c.drawCentredString(width / 2, height / 2 + 24, "OFD 文件已识别，但当前电脑未完成 OFD 转 PDF")
+    c.setFont(FONT_NAME, 10)
+    c.drawCentredString(width / 2, height / 2, item.path.name)
+    c.drawCentredString(width / 2, height / 2 - 22, "如需完整嵌入版式，请安装本地 ofd2pdf 转换工具后重新添加。")
+    c.save()
+    writer.add_page(PdfReader(tmp.name).pages[0])
+    os.unlink(tmp.name)
+    return page_no + 1
 
 
 def grid_for_count(count: int) -> tuple[int, int]:
@@ -223,25 +828,31 @@ def grid_for_count(count: int) -> tuple[int, int]:
 def add_image_page(writer: PdfWriter, item: InvoiceItem, amount: Decimal | None, vouchers: int, page_no: int, total_pages_text: str) -> int:
     tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".pdf")
     tmp.close()
-    width, height = PAGE_SIZE
     paths = item.image_paths or [item.path]
+    width, height = A4 if is_single_portrait_image_page(item) else PAGE_SIZE
+    side_header = uses_portrait_side_header(item, width, height)
+    content_left, content_right, content_bottom, content_top = document_content_bounds(width, height) if side_header else content_bounds(width, height)
     cols, rows = grid_for_count(len(paths))
     gap = IMAGE_GAP
-    content_w = CONTENT_RIGHT - CONTENT_LEFT
-    content_h = CONTENT_TOP - CONTENT_BOTTOM
+    content_w = content_right - content_left
+    content_h = content_top - content_bottom
     cell_w = (content_w - gap * (cols - 1)) / cols
     cell_h = (content_h - gap * (rows - 1)) / rows
 
-    c = canvas.Canvas(tmp.name, pagesize=PAGE_SIZE)
+    c = canvas.Canvas(tmp.name, pagesize=(width, height))
     c.setFont(FONT_NAME, HEADER_FONT_SIZE)
-    c.drawString(HEADER_SIDE_INSET, HEADER_Y, f"报销金额：{format_money(amount)}")
-    c.drawCentredString(width / 2, HEADER_Y, f"原始凭证张数：{vouchers}")
-    c.drawRightString(width - HEADER_SIDE_INSET, HEADER_Y, f"第{page_no}页/共{total_pages_text or '   '}张")
+    if side_header:
+        draw_portrait_side_header(c, width, height, amount, vouchers, page_no, total_pages_text)
+    else:
+        header_y = header_y_for_page(height)
+        c.drawString(HEADER_SIDE_INSET, header_y, f"报销金额：{format_money(amount)}")
+        c.drawCentredString(width / 2, header_y, f"原始凭证张数：{vouchers}")
+        c.drawRightString(width - HEADER_SIDE_INSET, header_y, f"第{page_no}页/共{total_pages_text or '   '}张")
     for index, path in enumerate(paths[:9]):
         row = index // cols
         col = index % cols
-        cell_x = CONTENT_LEFT + col * (cell_w + gap)
-        cell_y = CONTENT_TOP - (row + 1) * cell_h - row * gap
+        cell_x = content_left + col * (cell_w + gap)
+        cell_y = content_top - (row + 1) * cell_h - row * gap
         with Image.open(path) as img:
             img_w, img_h = img.size
         scale = min(cell_w / img_w, cell_h / img_h)
@@ -259,11 +870,12 @@ def add_image_page(writer: PdfWriter, item: InvoiceItem, amount: Decimal | None,
 
 def compile_pdf(items: list[InvoiceItem], output_path: Path, total_pages_text: str) -> None:
     writer = PdfWriter()
-    total_pages = sum(max(item.pages, 1) for item in items)
     page_no = 1
     for item in items:
         suffix = item.path.suffix.lower()
-        if item.is_pdf:
+        if item.is_ofd and item.render_path is None:
+            page_no = add_ofd_notice_page(writer, item, page_no, total_pages_text)
+        elif item.is_document:
             page_no = add_pdf_pages(writer, item, item.amount, item.voucher_count, page_no, total_pages_text)
         elif item.is_image_page or suffix in IMAGE_EXTS:
             page_no = add_image_page(writer, item, item.amount, item.voucher_count, page_no, total_pages_text)
@@ -281,7 +893,9 @@ class InvoiceApp(tk.Tk):
         self.configure(bg="#eef2f5")
         self.items: list[InvoiceItem] = []
         self.total_pages_text_var = tk.StringVar()
-        self.total_pages_text_var.trace_add("write", lambda *_args: self.update_preview())
+        self.total_pages_user_edited = False
+        self._updating_total_pages_text = False
+        self.total_pages_text_var.trace_add("write", self._on_total_pages_text_changed)
         self.preview_photo: ImageTk.PhotoImage | None = None
         self._build_ui()
         self._refresh_summary()
@@ -349,6 +963,7 @@ class InvoiceApp(tk.Tk):
         total_entry = tk.Entry(total_card, textvariable=self.total_pages_text_var, bg="#f8fafc", fg="#172033", relief=tk.FLAT, highlightthickness=1, highlightbackground="#cbd5e1", font=("Microsoft YaHei UI", 11))
         total_entry.pack(anchor=tk.W, padx=22, ipady=4, ipadx=6, fill=tk.X)
         self._make_button(top, "生成 PDF", self.export_pdf, primary=True).pack(side=tk.RIGHT, pady=(17, 0), ipadx=12)
+        self._make_button(top, "打印", self.print_pdf, accent=True).pack(side=tk.RIGHT, pady=(17, 0), padx=(0, 10), ipadx=12)
 
         content = tk.Frame(root, bg="#eef2f5")
         content.pack(fill=tk.BOTH, expand=True)
@@ -364,13 +979,14 @@ class InvoiceApp(tk.Tk):
         preview_frame.pack_propagate(False)
 
         self._panel_title(action_panel, "操作")
-        self._make_button(action_panel, "添加 PDF", self.add_pdf_files, primary=True).pack(fill=tk.X, padx=22, pady=(0, 12))
+        self._make_button(action_panel, "添加 PDF / OFD", self.add_pdf_files, primary=True).pack(fill=tk.X, padx=22, pady=(0, 12))
         self._make_button(action_panel, "添加图片", self.add_image_page_files, accent=True).pack(fill=tk.X, padx=22, pady=(0, 12))
         self._make_button(action_panel, "修改选中", self.edit_selected).pack(fill=tk.X, padx=22, pady=(0, 12))
         self._make_button(action_panel, "删除选中", self.remove_selected).pack(fill=tk.X, padx=22, pady=(0, 12))
+        self._make_button(action_panel, "关于软件", self.show_about).pack(fill=tk.X, padx=22, pady=(0, 12))
         tk.Label(
             action_panel,
-            text="提示：PDF 会缩小放入横向 A4 页面；图片可新开一页或追加到选中的图片页。",
+            text="提示：PDF/OFD 会按原方向缩小放入 A4 页面；图片可新开一页或追加到选中的图片页。",
             wraplength=160,
             justify=tk.LEFT,
             bg="#ffffff",
@@ -409,18 +1025,20 @@ class InvoiceApp(tk.Tk):
 
     def add_pdf_files(self) -> None:
         filetypes = [
+            ("PDF / OFD", "*.pdf *.ofd"),
             ("PDF", "*.pdf"),
+            ("OFD", "*.ofd"),
             ("所有文件", "*.*"),
         ]
-        paths = filedialog.askopenfilenames(title="选择 PDF 发票文件", filetypes=filetypes)
+        paths = filedialog.askopenfilenames(title="选择 PDF / OFD 发票文件", filetypes=filetypes)
         if not paths:
             return
         for raw_path in paths:
             item = inspect_file(Path(raw_path))
-            if item.is_pdf:
+            if item.is_document:
                 self.items.append(item)
             else:
-                messagebox.showwarning(APP_TITLE, f"已跳过非 PDF 文件：\n{raw_path}")
+                messagebox.showwarning(APP_TITLE, f"已跳过非 PDF/OFD 文件：\n{raw_path}")
         self._reload_table()
 
     def add_image_page_files(self) -> None:
@@ -558,6 +1176,30 @@ class InvoiceApp(tk.Tk):
             return
         messagebox.showinfo(APP_TITLE, f"已生成：\n{output}")
 
+    def print_pdf(self) -> None:
+        if not self.items:
+            messagebox.showinfo(APP_TITLE, "请先添加发票文件。")
+            return
+        output = Path(tempfile.gettempdir()) / default_output_filename()
+        try:
+            compile_pdf(self.items, output, self.total_pages_text_var.get().strip())
+            os.startfile(str(output), "print")  # type: ignore[attr-defined]
+        except Exception as exc:
+            messagebox.showerror(APP_TITLE, f"打印失败：{exc}")
+            return
+        messagebox.showinfo(APP_TITLE, "已交给系统打印流程，请在弹出的打印窗口中确认。")
+
+    def show_about(self) -> None:
+        messagebox.showinfo(
+            APP_TITLE,
+            f"发票汇编整理申报工具\n版本：{APP_VERSION}\n作者：{APP_AUTHOR}\n\n本地处理文件，不上传发票内容。",
+        )
+
+    def _on_total_pages_text_changed(self, *_args) -> None:
+        if not self._updating_total_pages_text:
+            self.total_pages_user_edited = True
+        self.update_preview()
+
     def _reload_table(self) -> None:
         self.tree.delete(*self.tree.get_children())
         for index, item in enumerate(self.items):
@@ -578,12 +1220,16 @@ class InvoiceApp(tk.Tk):
 
     def _refresh_summary(self) -> None:
         total_amount = sum((item.amount or Decimal("0.00") for item in self.items), Decimal("0.00"))
-        voucher_count = sum(item.voucher_count for item in self.items)
+        voucher_count = total_voucher_count(self.items)
         pages = sum(item.pages for item in self.items)
         if hasattr(self, "total_amount_var"):
             self.total_amount_var.set(format_money(total_amount))
             self.total_vouchers_var.set(str(voucher_count))
             self.total_pages_var.set(str(pages))
+        if not self.total_pages_user_edited:
+            self._updating_total_pages_text = True
+            self.total_pages_text_var.set(str(voucher_count) if voucher_count else "")
+            self._updating_total_pages_text = False
 
     def update_preview(self) -> None:
         if not hasattr(self, "preview_canvas"):
@@ -615,10 +1261,11 @@ class InvoiceApp(tk.Tk):
 
     def _build_preview_image(self, item: InvoiceItem, page_no: int, canvas_w: int, canvas_h: int) -> Image.Image:
         margin = 12
-        scale = min((canvas_w - margin * 2) / PAGE_WIDTH, (canvas_h - margin * 2) / PAGE_HEIGHT)
+        preview_width, preview_height = preview_page_size_for_item(item)
+        scale = min((canvas_w - margin * 2) / preview_width, (canvas_h - margin * 2) / preview_height)
         scale = max(scale, 0.1)
-        page_w = int(PAGE_WIDTH * scale)
-        page_h = int(PAGE_HEIGHT * scale)
+        page_w = int(preview_width * scale)
+        page_h = int(preview_height * scale)
         image = Image.new("RGB", (canvas_w, canvas_h), "#f4f4f4")
         draw = ImageDraw.Draw(image)
         ox = (canvas_w - page_w) // 2
@@ -629,64 +1276,110 @@ class InvoiceApp(tk.Tk):
             return int(ox + x * scale)
 
         def py(y_from_bottom: float) -> int:
-            return int(oy + (PAGE_HEIGHT - y_from_bottom) * scale)
+            return int(oy + (preview_height - y_from_bottom) * scale)
 
         header_font = self._preview_font(max(11, int(HEADER_FONT_SIZE * scale * 1.55)))
         small_font = self._preview_font(max(10, int(10 * scale * 1.6)))
-        header_y = py(HEADER_Y) - int(HEADER_FONT_SIZE * scale)
+        header_y = py(header_y_for_page(preview_height)) - int(HEADER_FONT_SIZE * scale)
         amount_text = f"报销金额：{format_money(item.amount)}"
         voucher_text = f"原始凭证张数：{item.voucher_count}"
         page_text = f"第{page_no}页/共{self.total_pages_text_var.get().strip() or ' '}张"
-        draw.text((px(HEADER_SIDE_INSET), header_y), amount_text, fill="black", font=header_font)
-        voucher_box = draw.textbbox((0, 0), voucher_text, font=header_font)
-        draw.text((px(PAGE_WIDTH / 2) - (voucher_box[2] - voucher_box[0]) / 2, header_y), voucher_text, fill="black", font=header_font)
-        page_box = draw.textbbox((0, 0), page_text, font=header_font)
-        draw.text((px(PAGE_WIDTH - HEADER_SIDE_INSET) - (page_box[2] - page_box[0]), header_y), page_text, fill="black", font=header_font)
-        if item.is_image_page:
-            self._draw_image_preview(image, draw, item, scale, ox, oy)
+        if uses_portrait_side_header(item, preview_width, preview_height):
+            items = [
+                (amount_text, preview_height - PORTRAIT_SIDE_HEADER_TOP),
+                (voucher_text, preview_height / 2),
+                (page_text, PORTRAIT_SIDE_HEADER_BOTTOM),
+            ]
+            for text, center_y in items:
+                text_box = draw.textbbox((0, 0), text, font=header_font)
+                text_w = max(1, text_box[2] - text_box[0])
+                text_h = max(1, text_box[3] - text_box[1])
+                text_image = Image.new("RGBA", (text_w + 8, text_h + 8), (255, 255, 255, 0))
+                text_draw = ImageDraw.Draw(text_image)
+                text_draw.text((4, 4), text, fill="black", font=header_font)
+                rotated = text_image.rotate(-90, expand=True)
+                paste_x = px(preview_width - PORTRAIT_SIDE_HEADER_X_OFFSET) - rotated.width // 2
+                paste_y = py(center_y) - rotated.height // 2
+                image.paste(rotated, (paste_x, paste_y), rotated)
         else:
-            self._draw_pdf_preview(draw, item, scale, ox, oy, small_font)
+            draw.text((px(HEADER_SIDE_INSET), header_y), amount_text, fill="black", font=header_font)
+            voucher_box = draw.textbbox((0, 0), voucher_text, font=header_font)
+            draw.text((px(preview_width / 2) - (voucher_box[2] - voucher_box[0]) / 2, header_y), voucher_text, fill="black", font=header_font)
+            page_box = draw.textbbox((0, 0), page_text, font=header_font)
+            draw.text((px(preview_width - HEADER_SIDE_INSET) - (page_box[2] - page_box[0]), header_y), page_text, fill="black", font=header_font)
+        if item.is_image_page:
+            self._draw_image_preview(image, draw, item, scale, ox, oy, preview_width, preview_height)
+        else:
+            self._draw_pdf_preview(draw, item, scale, ox, oy, small_font, preview_width, preview_height)
         return image
 
-    def _draw_pdf_preview(self, draw: ImageDraw.ImageDraw, item: InvoiceItem, scale: float, ox: int, oy: int, font: ImageFont.ImageFont) -> None:
+    def _draw_pdf_preview(
+        self,
+        draw: ImageDraw.ImageDraw,
+        item: InvoiceItem,
+        scale: float,
+        ox: int,
+        oy: int,
+        font: ImageFont.ImageFont,
+        page_width: float,
+        page_height: float,
+    ) -> None:
+        source_path = item.render_path or item.path
         try:
-            first_page = PdfReader(str(item.path)).pages[0]
-            source_w = float(first_page.mediabox.width)
-            source_h = float(first_page.mediabox.height)
+            first_page = PdfReader(str(source_path)).pages[0]
+            source_w, source_h = pdf_display_size(first_page)
         except Exception:
             source_w, source_h = A4
-        content_w = CONTENT_RIGHT - CONTENT_LEFT
-        content_h = CONTENT_TOP - CONTENT_BOTTOM
-        fit = min(content_w / source_w, content_h / source_h) * PDF_SCALE_FACTOR
+        content_left, content_right, content_bottom, content_top = document_content_bounds(page_width, page_height)
+        content_w = content_right - content_left
+        content_h = content_top - content_bottom
+        scale_factor = 0.98 if page_height > page_width else PDF_SCALE_FACTOR
+        fit = min(content_w / source_w, content_h / source_h) * scale_factor
         draw_w = source_w * fit
         draw_h = source_h * fit
-        centered_x = CONTENT_LEFT + (content_w - draw_w) / 2
-        x = min(centered_x + PDF_X_OFFSET, CONTENT_RIGHT - draw_w)
-        y_bottom = CONTENT_BOTTOM + (content_h - draw_h) / 2
+        centered_x = content_left + (content_w - draw_w) / 2
+        x = min(centered_x + PDF_X_OFFSET, content_right - draw_w)
+        y_bottom = content_bottom + (content_h - draw_h) / 2
         left = int(ox + x * scale)
-        top = int(oy + (PAGE_HEIGHT - y_bottom - draw_h) * scale)
+        top = int(oy + (page_height - y_bottom - draw_h) * scale)
         right = int(left + draw_w * scale)
         bottom = int(top + draw_h * scale)
         draw.rectangle([left, top, right, bottom], fill="#fafafa", outline="#999", width=2)
-        label = f"PDF 页面缩放预览：{item.path.name}"
+        label = f"{'OFD' if item.is_ofd else 'PDF'} 页面缩放预览：{item.path.name}"
+        if item.is_ofd and item.render_path is None:
+            label = f"OFD 待转换：{item.path.name}"
         box = draw.textbbox((0, 0), label, font=font)
         draw.text((left + (right - left - (box[2] - box[0])) / 2, top + (bottom - top) / 2), label, fill="#555", font=font)
 
-    def _draw_image_preview(self, target: Image.Image, draw: ImageDraw.ImageDraw, item: InvoiceItem, scale: float, ox: int, oy: int) -> None:
+    def _draw_image_preview(
+        self,
+        target: Image.Image,
+        draw: ImageDraw.ImageDraw,
+        item: InvoiceItem,
+        scale: float,
+        ox: int,
+        oy: int,
+        page_width: float,
+        page_height: float,
+    ) -> None:
         paths = (item.image_paths or [item.path])[:9]
         cols, rows = grid_for_count(len(paths))
         gap = IMAGE_GAP
-        content_w = CONTENT_RIGHT - CONTENT_LEFT
-        content_h = CONTENT_TOP - CONTENT_BOTTOM
+        if uses_portrait_side_header(item, page_width, page_height):
+            content_left, content_right, content_bottom, content_top = document_content_bounds(page_width, page_height)
+        else:
+            content_left, content_right, content_bottom, content_top = content_bounds(page_width, page_height)
+        content_w = content_right - content_left
+        content_h = content_top - content_bottom
         cell_w = (content_w - gap * (cols - 1)) / cols
         cell_h = (content_h - gap * (rows - 1)) / rows
         for index, path in enumerate(paths):
             row = index // cols
             col = index % cols
-            cell_x = CONTENT_LEFT + col * (cell_w + gap)
-            cell_y_bottom = CONTENT_TOP - (row + 1) * cell_h - row * gap
+            cell_x = content_left + col * (cell_w + gap)
+            cell_y_bottom = content_top - (row + 1) * cell_h - row * gap
             cell_left = int(ox + cell_x * scale)
-            cell_top = int(oy + (PAGE_HEIGHT - cell_y_bottom - cell_h) * scale)
+            cell_top = int(oy + (page_height - cell_y_bottom - cell_h) * scale)
             cell_right = int(cell_left + cell_w * scale)
             cell_bottom = int(cell_top + cell_h * scale)
             draw.rectangle([cell_left, cell_top, cell_right, cell_bottom], outline="#e2e2e2", width=1)
