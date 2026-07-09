@@ -149,6 +149,16 @@ def total_voucher_count(items: list[InvoiceItem]) -> int:
     return sum(max(0, item.voucher_count) for item in items)
 
 
+def available_document_pages(item: InvoiceItem) -> int:
+    if item.is_image_page or item.path.suffix.lower() in IMAGE_EXTS:
+        return 1
+    source_path = item.render_path or item.path
+    try:
+        return max(1, len(PdfReader(str(source_path)).pages))
+    except Exception:
+        return max(1, item.pages)
+
+
 def content_bounds(page_width: float, page_height: float) -> tuple[float, float, float, float]:
     left = CONTENT_LEFT
     right = page_width - CONTENT_RIGHT_MARGIN
@@ -771,7 +781,10 @@ def add_pdf_pages(writer: PdfWriter, item: InvoiceItem, amount: Decimal | None, 
     source_path = item.render_path or item.path
     reader = PdfReader(str(source_path))
     page_no = start_page
-    for source_page in reader.pages:
+    page_limit = min(max(1, item.pages), len(reader.pages))
+    for source_index, source_page in enumerate(reader.pages):
+        if source_index >= page_limit:
+            break
         # 规范化 PDF 自带的 /Rotate 标记，只保留文件原本的视觉方向，不额外旋转页面。
         if source_page.rotation:
             source_page.transfer_rotation_to_content()
@@ -897,6 +910,7 @@ class InvoiceApp(tk.Tk):
         self._updating_total_pages_text = False
         self.total_pages_text_var.trace_add("write", self._on_total_pages_text_changed)
         self.preview_photo: ImageTk.PhotoImage | None = None
+        self._drag_row_index: int | None = None
         self._build_ui()
         self._refresh_summary()
 
@@ -1015,6 +1029,9 @@ class InvoiceApp(tk.Tk):
         self.tree.bind("<Double-1>", lambda _event: self.edit_selected())
         self.tree.bind("<Delete>", lambda _event: self.remove_selected())
         self.tree.bind("<<TreeviewSelect>>", lambda _event: self.update_preview())
+        self.tree.bind("<ButtonPress-1>", self._start_tree_drag, add="+")
+        self.tree.bind("<B1-Motion>", self._move_tree_drag, add="+")
+        self.tree.bind("<ButtonRelease-1>", self._finish_tree_drag, add="+")
 
         self._panel_title(preview_frame, "实时预览")
         preview_container = tk.Frame(preview_frame, bg="#ffffff")
@@ -1022,6 +1039,44 @@ class InvoiceApp(tk.Tk):
         self.preview_canvas = tk.Canvas(preview_container, bg="#f8fafc", highlightthickness=1, highlightbackground="#cbd5e1")
         self.preview_canvas.pack(fill=tk.BOTH, expand=True)
         self.preview_canvas.bind("<Configure>", lambda _event: self.update_preview())
+
+    def _start_tree_drag(self, event: tk.Event) -> None:
+        if self.tree.identify_region(event.x, event.y) != "cell":
+            self._drag_row_index = None
+            return
+        row = self.tree.identify_row(event.y)
+        if not row:
+            self._drag_row_index = None
+            return
+        self._drag_row_index = int(row)
+        self.tree.selection_set(row)
+        self.tree.focus(row)
+
+    def _move_tree_drag(self, event: tk.Event):
+        if self._drag_row_index is None:
+            return None
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return "break"
+        target_index = int(row)
+        source_index = self._drag_row_index
+        if target_index == source_index or not (0 <= source_index < len(self.items)):
+            return "break"
+
+        moved_item = self.items.pop(source_index)
+        self.items.insert(target_index, moved_item)
+        self._drag_row_index = target_index
+        self._reload_table()
+        target_iid = str(target_index)
+        self.tree.selection_set(target_iid)
+        self.tree.focus(target_iid)
+        self.tree.see(target_iid)
+        self.tree.configure(cursor="fleur")
+        return "break"
+
+    def _finish_tree_drag(self, _event: tk.Event) -> None:
+        self._drag_row_index = None
+        self.tree.configure(cursor="")
 
     def add_pdf_files(self) -> None:
         filetypes = [
@@ -1149,12 +1204,24 @@ class InvoiceApp(tk.Tk):
         if dialog.saved:
             item.amount = normalize_amount(dialog.amount_var.get())
             if item.is_image_page:
-                item.voucher_count = len(item.image_paths or [])
+                try:
+                    item.voucher_count = max(1, int(dialog.vouchers_var.get()))
+                except ValueError:
+                    item.voucher_count = max(1, len(item.image_paths or []))
+                item.pages = 1
             else:
                 try:
                     item.voucher_count = max(1, int(dialog.vouchers_var.get()))
                 except ValueError:
                     item.voucher_count = 1
+                available_pages = available_document_pages(item)
+                try:
+                    requested_pages = max(1, int(dialog.pages_var.get()))
+                except ValueError:
+                    requested_pages = item.pages
+                if requested_pages > available_pages:
+                    messagebox.showwarning(APP_TITLE, f"原文件最多有 {available_pages} 页，汇编页数已自动调整为 {available_pages}。")
+                item.pages = min(requested_pages, available_pages)
             self._reload_table()
 
     def export_pdf(self) -> None:
@@ -1402,6 +1469,7 @@ class EditDialog(tk.Toplevel):
         self.saved = False
         self.amount_var = tk.StringVar(value=format_money(item.amount))
         self.vouchers_var = tk.StringVar(value=str(item.voucher_count))
+        self.pages_var = tk.StringVar(value=str(item.pages))
 
         frame = ttk.Frame(self, padding=16)
         frame.pack(fill=tk.BOTH, expand=True)
@@ -1409,15 +1477,17 @@ class EditDialog(tk.Toplevel):
         ttk.Label(frame, text="报销金额").grid(row=1, column=0, sticky=tk.W, pady=4)
         ttk.Entry(frame, textvariable=self.amount_var, width=24).grid(row=1, column=1, sticky=tk.W, pady=4)
         ttk.Label(frame, text="原始凭证张数").grid(row=2, column=0, sticky=tk.W, pady=4)
-        voucher_state = "readonly" if item.is_image_page else "normal"
-        ttk.Entry(frame, textvariable=self.vouchers_var, width=24, state=voucher_state).grid(row=2, column=1, sticky=tk.W, pady=4)
+        ttk.Entry(frame, textvariable=self.vouchers_var, width=24).grid(row=2, column=1, sticky=tk.W, pady=4)
+        ttk.Label(frame, text="汇编页数").grid(row=3, column=0, sticky=tk.W, pady=4)
+        pages_state = "readonly" if item.is_image_page else "normal"
+        ttk.Entry(frame, textvariable=self.pages_var, width=24, state=pages_state).grid(row=3, column=1, sticky=tk.W, pady=4)
         if item.is_image_page:
-            ttk.Label(frame, text="图片页的凭证张数会按图片数量自动更新。", foreground="#555").grid(
-                row=3, column=0, columnspan=2, sticky=tk.W, pady=(4, 0)
+            ttk.Label(frame, text="图片页的汇编页数固定为 1。", foreground="#555").grid(
+                row=4, column=0, columnspan=2, sticky=tk.W, pady=(4, 0)
             )
 
         buttons = ttk.Frame(frame)
-        buttons.grid(row=4, column=0, columnspan=2, sticky=tk.E, pady=(14, 0))
+        buttons.grid(row=5, column=0, columnspan=2, sticky=tk.E, pady=(14, 0))
         ttk.Button(buttons, text="取消", command=self.destroy).pack(side=tk.RIGHT)
         ttk.Button(buttons, text="保存", command=self._save).pack(side=tk.RIGHT, padx=(0, 8))
 
