@@ -58,9 +58,38 @@ PDF_SCALE_FACTOR = 0.90  # PDF 原页缩放比例；越小 PDF 越小，留白�
 PDF_X_OFFSET = 34  # PDF 缩小后向右偏移量；越大越靠右，左侧留白越多。
 IMAGE_GAP = 14  # 多张图片之间的间距；越大图片之间空隙越宽。
 PREVIEW_PANEL_WIDTH = 440  # 右侧预览栏宽度；想让预览更大就调高。
+PDF_OCR_DPI = 200  # 扫描 PDF / OFD 转换页 OCR 前的渲染分辨率；越高越准但越慢。
 
 # 页眉纵向位置用横版 A4 做基准；竖版页面会自动保持同样的顶部距离。
 HEADER_TOP_OFFSET = PAGE_HEIGHT - HEADER_Y
+AMOUNT_KEYWORDS = ("价税合计", "合计金额", "小写", "报销金额", "金额合计", "总金额", "金额", "合计")
+INVOICE_STRONG_MARKERS = (
+    "价税合计",
+    "合计金额",
+    "小写",
+    "开票日期",
+    "购买方",
+    "销售方",
+    "税额",
+    "税率",
+    "发票代码",
+    "发票号码",
+    "电子发票",
+    "普通发票",
+    "专用发票",
+)
+PAYMENT_PROOF_MARKERS = (
+    "支付成功",
+    "退款记录",
+    "交易单号",
+    "商户单号",
+    "收单机构",
+    "支付方式",
+    "当前状态",
+    "已退款",
+)
+_rapidocr_engine = None
+_rapidocr_error: str | None = None
 
 
 def bundled_python() -> str:
@@ -254,6 +283,11 @@ def bundled_easyofd_dir() -> Path | None:
     return candidate if candidate.exists() else None
 
 
+def bundled_rapidocr_models_dir() -> Path | None:
+    candidate = app_resource_dir() / "tools" / "rapidocr_models"
+    return candidate if candidate.exists() else None
+
+
 def normalize_amount(value: str | Decimal | int | float | None) -> Decimal | None:
     if value is None:
         return None
@@ -276,11 +310,54 @@ def default_output_filename() -> str:
     return f"发票汇编_{datetime.now().strftime('%Y%m%d_%H%M%S')}.pdf"
 
 
+def _amount_candidates(text: str, allow_plain_integer: bool = False) -> list[Decimal]:
+    cleaned = text.replace("，", ",").replace("．", ".").replace("。", ".")
+    amounts: list[Decimal] = []
+    pattern = re.compile(r"(?:CNY|RMB|人民币|[¥￥])?\s*([0-9][0-9,]*(?:\s*\.\s*[0-9]{1,2})?)", re.IGNORECASE)
+    for match in pattern.finditer(cleaned):
+        token = match.group(0).strip()
+        value = match.group(1).replace(" ", "")
+        has_decimal = "." in value
+        has_currency = token.upper().startswith(("CNY", "RMB")) or token.startswith(("人民币", "¥", "￥"))
+        if not allow_plain_integer and not has_decimal and not has_currency:
+            continue
+        amount = normalize_amount(value)
+        if amount is not None and Decimal("0") < amount < Decimal("10000000"):
+            amounts.append(amount)
+    return amounts
+
+
+def _keyword_amount(text: str) -> Decimal | None:
+    lines = [line.strip() for line in re.split(r"[\r\n]+", text) if line.strip()]
+    for index, line in enumerate(lines):
+        compact_line = re.sub(r"\s+", "", line)
+        if not any(keyword in compact_line for keyword in AMOUNT_KEYWORDS):
+            continue
+        window = "\n".join(lines[index : index + 2])
+        amounts = _amount_candidates(window)
+        if not amounts:
+            amounts = _amount_candidates(window, allow_plain_integer=True)
+        if amounts:
+            return max(amounts)
+    compact = re.sub(r"\s+", "", text)
+    for keyword in AMOUNT_KEYWORDS:
+        match = re.search(rf"{re.escape(keyword)}[：:（(]?(?:人民币)?[¥￥]?([0-9][0-9,]*\.?[0-9]{{0,2}})", compact)
+        if not match:
+            continue
+        amount = normalize_amount(match.group(1))
+        if amount is not None and Decimal("0") < amount < Decimal("10000000"):
+            return amount
+    return None
+
+
 def extract_amount(text: str) -> Decimal | None:
+    keyword_amount = _keyword_amount(text)
+    if keyword_amount is not None:
+        return keyword_amount
+
     compact = re.sub(r"\s+", "", text)
     patterns = [
         r"(?:CNY|RMB|人民币|¥|￥)\s*([0-9]{1,7}(?:,[0-9]{3})*\.[0-9]{2})",
-        r"(?:价税合计|小写|合计金额|报销金额|金额合计|总金额|合计)[：:（(]?(?:人民币)?[¥￥]?([0-9][0-9,]*\.?[0-9]{0,2})",
         r"[¥￥]\s*([0-9][0-9,]*\.?[0-9]{0,2})",
         r"\b([0-9]{1,7}(?:,[0-9]{3})*\.[0-9]{2})\b",
     ]
@@ -295,17 +372,163 @@ def extract_amount(text: str) -> Decimal | None:
     return max(amounts) if amounts else None
 
 
-def try_image_ocr(path: Path) -> tuple[str, str]:
+def _compact_ocr_text(text: str) -> str:
+    return re.sub(r"\s+", "", text)
+
+
+def is_payment_proof_text(text: str) -> bool:
+    compact = _compact_ocr_text(text)
+    return any(marker in compact for marker in PAYMENT_PROOF_MARKERS)
+
+
+def is_invoice_like_image_text(text: str) -> bool:
+    compact = _compact_ocr_text(text)
+    if any(marker in compact for marker in INVOICE_STRONG_MARKERS):
+        return True
+    return "发票" in compact and not is_payment_proof_text(text)
+
+
+def extract_image_amount(text: str) -> Decimal | None:
+    if not is_invoice_like_image_text(text):
+        return None
+    return extract_amount(text)
+
+
+def _rapidocr_config_path() -> Path | None:
+    models_dir = bundled_rapidocr_models_dir()
+    if not models_dir:
+        return None
+    for name in ("rapidocr.yaml", "rapidocr.yml", "config.yaml", "config.yml"):
+        candidate = models_dir / name
+        if candidate.exists():
+            return candidate
+    return None
+
+
+def _get_rapidocr_engine():
+    global _rapidocr_engine, _rapidocr_error
+    if _rapidocr_engine is not None:
+        return _rapidocr_engine, ""
+    if _rapidocr_error:
+        return None, _rapidocr_error
     try:
-        import pytesseract  # type: ignore
-    except Exception:
-        return "", "未安装图片 OCR，需手动核对"
+        from rapidocr import RapidOCR  # type: ignore
+    except Exception as exc:
+        _rapidocr_error = f"OCR 不可用：未安装 rapidocr / onnxruntime（{exc}）"
+        return None, _rapidocr_error
 
     try:
-        text = pytesseract.image_to_string(Image.open(path), lang="chi_sim+eng")
+        config_path = _rapidocr_config_path()
+        if config_path:
+            _rapidocr_engine = RapidOCR(config_path=str(config_path))
+        else:
+            _rapidocr_engine = RapidOCR()
+        return _rapidocr_engine, ""
+    except Exception as exc:
+        _rapidocr_error = f"OCR 初始化失败：{exc}"
+        return None, _rapidocr_error
+
+
+def _rapidocr_text_lines(result) -> list[str]:
+    if result is None:
+        return []
+    for attr in ("txts", "texts", "rec_texts"):
+        values = getattr(result, attr, None)
+        if values:
+            return [str(value).strip() for value in values if str(value).strip()]
+    if isinstance(result, dict):
+        for key in ("txts", "texts", "rec_texts"):
+            values = result.get(key)
+            if values:
+                return [str(value).strip() for value in values if str(value).strip()]
+    if isinstance(result, tuple) and result:
+        return _rapidocr_text_lines(result[0])
+    if isinstance(result, list):
+        lines: list[str] = []
+        for item in result:
+            if hasattr(item, "text"):
+                text = str(item.text).strip()
+                if text:
+                    lines.append(text)
+            elif isinstance(item, (list, tuple)):
+                for value in item:
+                    if isinstance(value, str) and value.strip():
+                        lines.append(value.strip())
+                        break
+            elif isinstance(item, str) and item.strip():
+                lines.append(item.strip())
+        return lines
+    return []
+
+
+def try_image_ocr(path: Path) -> tuple[str, str]:
+    engine, error = _get_rapidocr_engine()
+    if engine is None:
+        return "", f"{error}，需手动核对"
+
+    try:
+        result = engine(str(path))
+        lines = _rapidocr_text_lines(result)
+        text = "\n".join(lines)
         return text, "图片 OCR 完成" if text.strip() else "图片 OCR 无文字"
     except Exception as exc:
         return "", f"图片 OCR 失败：{exc}"
+
+
+def _load_pymupdf():
+    try:
+        import pymupdf  # type: ignore
+
+        return pymupdf, ""
+    except Exception as first_exc:
+        try:
+            import fitz as pymupdf  # type: ignore
+
+            return pymupdf, ""
+        except Exception as second_exc:
+            return None, f"PDF OCR 不可用：未安装 PyMuPDF（{first_exc}; {second_exc}）"
+
+
+def ocr_pdf_pages(path: Path) -> tuple[str, str]:
+    engine, error = _get_rapidocr_engine()
+    if engine is None:
+        return "", f"{error}，需手动核对"
+
+    pymupdf, import_error = _load_pymupdf()
+    if pymupdf is None:
+        return "", f"{import_error}，需手动核对"
+
+    texts: list[str] = []
+    page_failures = 0
+    try:
+        with pymupdf.open(str(path)) as document:
+            for page in document:
+                tmp_path = ""
+                try:
+                    pixmap = page.get_pixmap(dpi=PDF_OCR_DPI, alpha=False)
+                    tmp = tempfile.NamedTemporaryFile(delete=False, suffix=".png")
+                    tmp_path = tmp.name
+                    tmp.close()
+                    pixmap.save(tmp_path)
+                    page_text, _status = try_image_ocr(Path(tmp_path))
+                    if page_text.strip():
+                        texts.append(page_text)
+                except Exception:
+                    page_failures += 1
+                finally:
+                    if tmp_path:
+                        with contextlib.suppress(Exception):
+                            Path(tmp_path).unlink(missing_ok=True)
+    except Exception as exc:
+        return "", f"PDF OCR 失败：{exc}"
+
+    if texts:
+        if page_failures:
+            return "\n".join(texts), "PDF OCR 部分完成，需核对金额"
+        return "\n".join(texts), "PDF OCR 完成"
+    if page_failures:
+        return "", "PDF OCR 未完成，需手动核对金额"
+    return "", "PDF OCR 无文字，需手动核对金额"
 
 
 def read_pdf_text_and_pages(path: Path) -> tuple[str, int, str]:
@@ -735,18 +958,35 @@ def inspect_file(path: Path) -> InvoiceItem:
     if suffix in PDF_EXTS:
         text, pages, status = read_pdf_text_and_pages(path)
         amount = extract_amount(text)
+        if amount is None:
+            ocr_text, ocr_status = ocr_pdf_pages(path)
+            if ocr_text.strip():
+                text = "\n".join(part for part in (text, ocr_text) if part.strip())
+                amount = extract_amount(text)
+            status = f"{status}；{ocr_status}"
         return InvoiceItem(path, amount, max(pages, 1), max(pages, 1), status, text)
     if suffix in OFD_EXTS:
         text, status = read_ofd_text(path)
         render_path, convert_status = convert_ofd_to_pdf(path)
+        status_parts = [status, convert_status]
         pages = 1
         if render_path:
-            _pdf_text, pages, _pdf_status = read_pdf_text_and_pages(render_path)
+            pdf_text, pages, _pdf_status = read_pdf_text_and_pages(render_path)
+            if pdf_text.strip():
+                text = "\n".join(part for part in (text, pdf_text) if part.strip())
         amount = extract_amount(text)
-        return InvoiceItem(path, amount, max(pages, 1), max(pages, 1), f"{status}；{convert_status}", text, render_path=render_path)
+        if amount is None and render_path:
+            ocr_text, ocr_status = ocr_pdf_pages(render_path)
+            status_parts.append(ocr_status)
+            if ocr_text.strip():
+                text = "\n".join(part for part in (text, ocr_text) if part.strip())
+                amount = extract_amount(text)
+        return InvoiceItem(path, amount, max(pages, 1), max(pages, 1), "；".join(status_parts), text, render_path=render_path)
     if suffix in IMAGE_EXTS:
         text, status = try_image_ocr(path)
-        amount = extract_amount(text)
+        amount = extract_image_amount(text)
+        if text.strip() and amount is None and not is_invoice_like_image_text(text):
+            status = "图片未识别为发票，金额可留空或手动填写"
         return InvoiceItem(path, amount, 1, 1, status, text)
     return InvoiceItem(path, None, 1, 1, "不支持的文件类型", "")
 
@@ -1136,17 +1376,22 @@ class InvoiceApp(tk.Tk):
             text, status = try_image_ocr(path)
             text_parts.append(text)
             status_parts.append(status)
-        amount = extract_amount("\n".join(text_parts))
+        extracted_text = "\n".join(text_parts)
+        amount = extract_image_amount(extracted_text)
         item = InvoiceItem(
             image_paths[0],
             amount,
             len(image_paths),
             1,
             "图片页，凭证张数已按图片数量更新",
-            "\n".join(text_parts),
+            extracted_text,
             image_paths,
         )
-        if any("OCR" in status for status in status_parts):
+        if amount is not None:
+            item.status = "图片页，已自动识别发票金额；凭证张数已按图片数量更新"
+        elif extracted_text.strip() and not is_invoice_like_image_text(extracted_text):
+            item.status = "图片页，未识别为发票，金额可留空或手动填写；凭证张数已自动更新"
+        elif any("OCR" in status for status in status_parts):
             item.status = "图片页，需核对金额；凭证张数已自动更新"
         return item
 
@@ -1171,9 +1416,14 @@ class InvoiceApp(tk.Tk):
             text, _status = try_image_ocr(path)
             new_text_parts.append(text)
         item.extracted_text = "\n".join(part for part in [item.extracted_text, "\n".join(new_text_parts)] if part)
-        if item.amount is None:
+        if item.amount is None and is_invoice_like_image_text(item.extracted_text):
             item.amount = extract_amount(item.extracted_text)
-        item.status = "图片页，已追加图片；凭证张数已自动更新"
+        if item.amount is not None:
+            item.status = "图片页，已追加图片；发票金额已保留；凭证张数已自动更新"
+        elif item.extracted_text.strip() and not is_invoice_like_image_text(item.extracted_text):
+            item.status = "图片页，已追加图片；未识别为发票，金额可留空或手动填写；凭证张数已自动更新"
+        else:
+            item.status = "图片页，已追加图片；凭证张数已自动更新"
 
     def _selected_image_page_index(self) -> int | None:
         for iid in self.tree.selection():
